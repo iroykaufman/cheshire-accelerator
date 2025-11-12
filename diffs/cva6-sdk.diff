@@ -1,0 +1,487 @@
+diff --git a/buildroot b/buildroot
+index aa433d1..5f1bc99 160000
+--- a/buildroot
++++ b/buildroot
+@@ -1 +1 @@
+-Subproject commit aa433d1c5cfbd72b64ff3f92f2ffa2e02ea7089b
++Subproject commit 5f1bc99cb7f30880e71889cda4f0a908f61e4dfd
+diff --git a/driver/Makefile b/driver/Makefile
+new file mode 100644
+index 0000000..f0da372
+--- /dev/null
++++ b/driver/Makefile
+@@ -0,0 +1,3 @@
++# Makefile for accel_driver
++
++obj-m := accel_driver.o
+diff --git a/driver/accel_driver-original.c b/driver/accel_driver-original.c
+new file mode 100644
+index 0000000..0e26ebe
+--- /dev/null
++++ b/driver/accel_driver-original.c
+@@ -0,0 +1,145 @@
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/io.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++
++#define DEVICE_NAME "accel"
++#define REG0_OFFSET       0x00
++#define REG1_OFFSET       0x80
++#define REG_RESULT_OFFSET 0x100
++#define OPCODE_OFFSET     0x180
++
++static void __iomem *accel_base;
++
++// ---- Character device operations ----
++static ssize_t accel_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++    if (*ppos < 0x100) {
++        if (count != 4) {
++            // Invalid size for reg0/reg1 write
++            return -EINVAL;
++        }
++        // Write reg0 or reg1 (1 word)
++        uint32_t value;
++        if (copy_from_user(&value, buf, sizeof(value)))
++            return -EFAULT;
++        writel(value, accel_base + *ppos);
++        return sizeof(value);
++    }
++    // Invalid offset
++    return -EINVAL;
++}
++
++static ssize_t accel_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++    if (*ppos < 0x100) {
++        if (count != 4) {
++            // Invalid size for reg0/reg1 read
++            return -EINVAL;
++        }
++        // Read reg0 or reg1 (1 word)
++        uint32_t value;
++        value = readl(accel_base + *ppos);
++        if (copy_to_user(buf, &value, sizeof(value)))
++            return -EFAULT;
++        return sizeof(value);
++    }
++    else if (*ppos >= 0x100) {
++        if (count != 8) {
++            // Invalid size for result read
++            return -EINVAL;
++        }
++        // Read result (2 words) - read as little-endian (low word first)
++        uint32_t low, high;
++        low = readl(accel_base + *ppos);
++        high = readl(accel_base + *ppos + 4);
++        uint64_t value = (uint64_t)low | ((uint64_t)high << 32);
++        if (copy_to_user(buf, &value, sizeof(value)))
++            return -EFAULT;
++        return sizeof(value);
++    }
++    // Invalid offset
++    return -EINVAL;
++}
++
++// IOCTL to trigger operation
++#define ACCEL_IOC_MAGIC 'x'
++#define ACCEL_IOC_OPCODE _IOW(ACCEL_IOC_MAGIC, 1, uint32_t)
++
++static long accel_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++    uint32_t value;
++
++    if (cmd != ACCEL_IOC_OPCODE)
++        return -EINVAL;
++
++    if (copy_from_user(&value, (uint32_t __user *)arg, sizeof(value)))
++        return -EFAULT;
++
++    writel(value, accel_base + OPCODE_OFFSET);
++    return 0;
++}
++
++static const struct file_operations accel_fops = {
++    .owner = THIS_MODULE,
++    .read = accel_read,
++    .write = accel_write,
++    .llseek = default_llseek,
++    .unlocked_ioctl = accel_ioctl,
++};
++
++static struct miscdevice accel_misc_device = {
++    .minor = MISC_DYNAMIC_MINOR,
++    .name = DEVICE_NAME,
++    .fops = &accel_fops,
++};
++
++// ---- Platform driver ----
++static int accel_probe(struct platform_device *pdev)
++{
++    struct resource *res;
++
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++    if (!res) {
++        dev_err(&pdev->dev, "No memory resource\n");
++        return -ENODEV;
++    }
++
++    accel_base = devm_ioremap_resource(&pdev->dev, res);
++    if (IS_ERR(accel_base))
++        return PTR_ERR(accel_base);
++
++    misc_register(&accel_misc_device);
++    pr_info("ACCEL driver initialized, /dev/%s created\n", DEVICE_NAME);
++    return 0;
++}
++
++static int accel_remove(struct platform_device *pdev)
++{
++    misc_deregister(&accel_misc_device);
++    return 0;
++}
++
++static const struct of_device_id accel_of_match[] = {
++    { .compatible = "custom,accel1024" },
++    {}
++};
++MODULE_DEVICE_TABLE(of, accel_of_match);
++
++static struct platform_driver accel_platform_driver = {
++    .probe = accel_probe,
++    .remove = accel_remove,
++    .driver = {
++        .name = "accel1024_driver",
++        .of_match_table = accel_of_match,
++    },
++};
++
++module_platform_driver(accel_platform_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Aviv / Roy");
++MODULE_DESCRIPTION("1024-bit accelerator driver");
+diff --git a/driver/accel_driver.c b/driver/accel_driver.c
+new file mode 100644
+index 0000000..52f8a8e
+--- /dev/null
++++ b/driver/accel_driver.c
+@@ -0,0 +1,172 @@
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/io.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++
++#define DEVICE_NAME "accel"
++#define REG0_OFFSET       0x00
++#define REG1_OFFSET       0x80
++#define REG_RESULT_OFFSET 0x100
++#define OPCODE_OFFSET     0x180
++
++static void __iomem *accel_base;
++static phys_addr_t accel_phys_addr;
++static resource_size_t accel_mem_size;
++
++// ---- Character device operations ----
++static ssize_t accel_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++    if (*ppos < 0x100) {
++        if (count != 4) {
++            // Invalid size for reg0/reg1 write
++            return -EINVAL;
++        }
++        // Write reg0 or reg1 (1 word)
++        uint32_t value;
++        if (copy_from_user(&value, buf, sizeof(value)))
++            return -EFAULT;
++        writel(value, accel_base + *ppos);
++        return sizeof(value);
++    }
++    // Invalid offset
++    return -EINVAL;
++}
++
++static ssize_t accel_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++    if (*ppos < 0x100) {
++        if (count != 4) {
++            // Invalid size for reg0/reg1 read
++            return -EINVAL;
++        }
++        // Read reg0 or reg1 (1 word)
++        uint32_t value;
++        value = readl(accel_base + *ppos);
++        if (copy_to_user(buf, &value, sizeof(value)))
++            return -EFAULT;
++        return sizeof(value);
++    }
++    else if (*ppos >= 0x100) {
++        if (count != 8) {
++            // Invalid size for result read
++            return -EINVAL;
++        }
++        // Read result (2 words) - read as little-endian (low word first)
++        uint32_t low, high;
++        low = readl(accel_base + *ppos);
++        high = readl(accel_base + *ppos + 4);
++        uint64_t value = (uint64_t)low | ((uint64_t)high << 32);
++        if (copy_to_user(buf, &value, sizeof(value)))
++            return -EFAULT;
++        return sizeof(value);
++    }
++    // Invalid offset
++    return -EINVAL;
++}
++
++// IOCTL to trigger operation
++#define ACCEL_IOC_MAGIC 'x'
++#define ACCEL_IOC_OPCODE _IOW(ACCEL_IOC_MAGIC, 1, uint32_t)
++
++static long accel_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++    uint32_t value;
++
++    if (cmd != ACCEL_IOC_OPCODE)
++        return -EINVAL;
++
++    if (copy_from_user(&value, (uint32_t __user *)arg, sizeof(value)))
++        return -EFAULT;
++
++    writel(value, accel_base + OPCODE_OFFSET);
++    return 0;
++}
++
++static int accel_mmap(struct file *file, struct vm_area_struct *vma)
++{
++    size_t size = vma->vm_end - vma->vm_start;
++    if (size > accel_mem_size)
++        return -EINVAL;
++
++    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);    
++    
++    if (remap_pfn_range(vma,
++                        vma->vm_start,
++                        accel_phys_addr >> PAGE_SHIFT,
++                        size,
++                        vma->vm_page_prot))
++        return -EAGAIN;
++
++    return 0;
++}
++
++static const struct file_operations accel_fops = {
++    .owner = THIS_MODULE,
++    .mmap = accel_mmap,
++    .read = accel_read,
++    .write = accel_write,
++    .llseek = default_llseek,
++    .unlocked_ioctl = accel_ioctl,
++};
++
++static struct miscdevice accel_misc_device = {
++    .minor = MISC_DYNAMIC_MINOR,
++    .name = DEVICE_NAME,
++    .fops = &accel_fops,
++};
++
++// ---- Platform driver ----
++static int accel_probe(struct platform_device *pdev)
++{
++    struct resource *res;
++
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++    if (!res) {
++        dev_err(&pdev->dev, "No memory resource\n");
++        return -ENODEV;
++    }
++
++    accel_phys_addr = res->start;
++    accel_mem_size = resource_size(res);
++
++    accel_base = devm_ioremap_resource(&pdev->dev, res);
++    if (IS_ERR(accel_base))
++        return PTR_ERR(accel_base);
++
++    misc_register(&accel_misc_device);
++    pr_info("ACCEL driver initialized, /dev/%s created at phys 0x%llx\n", 
++            DEVICE_NAME, (unsigned long long)accel_phys_addr);
++    return 0;
++}
++
++static int accel_remove(struct platform_device *pdev)
++{
++    misc_deregister(&accel_misc_device);
++    return 0;
++}
++
++static const struct of_device_id accel_of_match[] = {
++    { .compatible = "custom,accel1024" },
++    {}
++};
++MODULE_DEVICE_TABLE(of, accel_of_match);
++
++static struct platform_driver accel_platform_driver = {
++    .probe = accel_probe,
++    .remove = accel_remove,
++    .driver = {
++        .name = "accel1024_driver",
++        .of_match_table = accel_of_match,
++    },
++};
++
++module_platform_driver(accel_platform_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Aviv / Roy");
++MODULE_DESCRIPTION("1024-bit accelerator driver");
+diff --git a/driver/toy_driver-working.c b/driver/toy_driver-working.c
+new file mode 100644
+index 0000000..66ace39
+--- /dev/null
++++ b/driver/toy_driver-working.c
+@@ -0,0 +1,136 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/io.h>
++
++#define REG_STRIDE 0x80   // 128 bytes
++
++static void __iomem *accel_base;
++
++// Convenience macros for offsets
++#define REG0_OFFSET       0x00
++#define REG1_OFFSET       0x80
++#define REG_RESULT_OFFSET 0x100
++#define OPCODE_OFFSET     0x180
++
++// Write 1024-bit value to register 0
++static void write_1024_reg0(uint32_t data[32]) {
++    int i;
++    for (i = 0; i < 32; i++)
++        writel(data[i], accel_base + REG0_OFFSET + i*4);
++}
++
++// Read 1024-bit value from register 0
++static void read_1024_reg0(uint32_t data[32]) {
++    int i;
++    for (i = 0; i < 32; i++)
++        data[i] = readl(accel_base + REG0_OFFSET + i*4);
++}
++
++// Write 1024-bit value to register 1
++static void write_1024_reg1(uint32_t data[32]) {
++    int i;
++    for (i = 0; i < 32; i++)
++        writel(data[i], accel_base + REG1_OFFSET + i*4);
++}
++
++// Read 1024-bit value from register 1
++static void read_1024_reg1(uint32_t data[32]) {
++    int i;
++    for (i = 0; i < 32; i++)
++        data[i] = readl(accel_base + REG1_OFFSET + i*4);
++}
++
++// Write the opcode
++static void write_opcode(uint32_t opcode) {
++    writel(opcode, accel_base + OPCODE_OFFSET);
++}
++
++// Read the opcode
++static void read_opcode(uint32_t *opcode) {
++    *opcode = readl(accel_base + OPCODE_OFFSET);
++}
++
++// Simple 1024-bit addition (CPU-side)
++static void add_1024_bit(uint32_t a[32], uint32_t b[32], uint32_t result[32]) {
++    uint64_t carry = 0;
++    int i;
++    for (i = 0; i < 32; i++) {
++        uint64_t sum = (uint64_t)a[i] + (uint64_t)b[i] + carry;
++        result[i] = (uint32_t)sum;
++        carry = sum >> 32;
++    }
++}
++
++// ---- Platform driver probe ----
++static int accel_probe(struct platform_device *pdev)
++{
++    struct resource *res;
++    uint32_t test_vec[32], read_vec[32];
++    int i;
++
++    pr_info("ACCEL PLATFORM DRIVER INIT\n");
++
++    // Get memory resource from device tree
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++    if (!res) {
++        dev_err(&pdev->dev, "No memory resource found\n");
++        return -ENODEV;
++    }
++
++    // Map physical memory to virtual address
++    accel_base = devm_ioremap_resource(&pdev->dev, res);
++    if (IS_ERR(accel_base)) {
++        dev_err(&pdev->dev, "Failed to ioremap accel\n");
++        return PTR_ERR(accel_base);
++    }
++
++    // Test write/read to register 0
++    for (i = 0; i < 32; i++)
++        test_vec[i] = 0xdead0000 + i;
++
++    write_1024_reg0(test_vec);
++    read_1024_reg0(read_vec);
++
++    for (i = 0; i < 32; i++) {
++        if (read_vec[i] != test_vec[i]) {
++            dev_err(&pdev->dev, "ACCEL FAIL at index %d\n", i);
++            return -EIO;
++        }
++    }
++
++    pr_info("ACCEL PLATFORM DRIVER SUCCESS\n");
++    return 0;
++}
++
++static int accel_remove(struct platform_device *pdev)
++{
++    pr_info("ACCEL PLATFORM DRIVER EXIT\n");
++    return 0;
++}
++
++// Device tree match table
++static const struct of_device_id accel_of_match[] = {
++    { .compatible = "custom,accel1024", },
++    { }
++};
++MODULE_DEVICE_TABLE(of, accel_of_match);
++
++// Platform driver structure
++static struct platform_driver accel_platform_driver = {
++    .probe = accel_probe,
++    .remove = accel_remove,
++    .driver = {
++        .name = "accel1024_driver",
++        .of_match_table = accel_of_match,
++    },
++};
++
++module_platform_driver(accel_platform_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Roy Kaufman / Aviv");
++MODULE_DESCRIPTION("Platform driver for 1024-bit accelerator");
++MODULE_VERSION("1.0");

@@ -1,0 +1,705 @@
+diff --git a/.gitignore b/.gitignore
+index 4c8e9b8..6959835 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -53,3 +53,9 @@ target/xilinx/build
+ target/xilinx/out
+ target/xilinx/scripts/add_sources.*
+ vivado*
++.vscode/settings.json
++transcript
++commands.txt
++
++# work
++work/*
+\ No newline at end of file
+diff --git a/Bender.yml b/Bender.yml
+index a670014..9ebaa18 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -40,6 +40,7 @@ sources:
+   - hw/future/spinal_usb_ohci.sv
+   - hw/bootrom/cheshire_bootrom.sv
+   - hw/regs/cheshire_reg_pkg.sv
++  - hw/regs/cheshire_reg_accel1024.sv
+   - hw/regs/cheshire_reg_top.sv
+   - hw/cheshire_idma_wrap.sv
+   - hw/cheshire_pkg.sv
+diff --git a/cheshire.mk b/cheshire.mk
+index 62ec6e7..43744a7 100644
+--- a/cheshire.mk
++++ b/cheshire.mk
+@@ -83,7 +83,7 @@ include $(CHS_ROOT)/sw/sw.mk
+ ###############
+ 
+ # SoC registers
+-$(CHS_ROOT)/hw/regs/cheshire_reg_pkg.sv $(CHS_ROOT)/hw/regs/cheshire_reg_top.sv: $(CHS_ROOT)/hw/regs/cheshire_regs.hjson
++$(CHS_ROOT)/hw/regs/cheshire_reg_pkg.sv $(CHS_ROOT)/hw/regs/cheshire_reg_top.sv $(CHS_ROOT)/hw/regs/cheshire_reg_accel1024.sv: $(CHS_ROOT)/hw/regs/cheshire_regs.hjson
+ 	$(REGTOOL) -r $< --outdir $(dir $@)
+ 
+ # CLINT
+@@ -118,7 +118,9 @@ $(CHS_SLINK_DIR)/.generated: $(CHS_ROOT)/hw/serial_link.hjson
+ include $(IDMA_ROOT)/idma.mk
+ 
+ CHS_HW_ALL += $(IDMA_FULL_RTL)
+-CHS_HW_ALL += $(CHS_ROOT)/hw/regs/cheshire_reg_pkg.sv $(CHS_ROOT)/hw/regs/cheshire_reg_top.sv
++CHS_HW_ALL += $(CHS_ROOT)/hw/regs/cheshire_reg_pkg.sv $(CHS_ROOT)/hw/regs/cheshire_reg_top.sv 
++# Local addition
++CHS_HW_ALL += $(CHS_ROOT)/hw/regs/cheshire_reg_accel1024.sv
+ CHS_HW_ALL += $(CLINTROOT)/.generated
+ CHS_HW_ALL += $(OTPROOT)/.generated
+ CHS_HW_ALL += $(AXIRTROOT)/.generated
+diff --git a/commands.txt b/commands.txt
+new file mode 100644
+index 0000000..85781e6
+--- /dev/null
++++ b/commands.txt
+@@ -0,0 +1,8 @@
++cd ~/cheshire/target/sim/vsim
++set BINARY ../../../sw/tests/accel_test.spm.elf
++source start.cheshire_soc.tcl
++run -all
++ 
++ 
++ 
++source compile.cheshire_soc.tcl
+\ No newline at end of file
+diff --git a/hw/cheshire_pkg.sv b/hw/cheshire_pkg.sv
+index a6d4548..b5cfe94 100644
+--- a/hw/cheshire_pkg.sv
++++ b/hw/cheshire_pkg.sv
+@@ -650,6 +650,12 @@ package cheshire_pkg;
+     ClicVsprio        : 0,
+     ClicNumVsctxts    : 4,
+     ClicPrioWidth     : 1,
++    // Reg Ext
++    RegExtNumSlv      : 1,
++    RegExtNumRules    : 1,
++    RegExtRegionIdx   : '{default: '0},
++    RegExtRegionStart : '{default: 32'h0300_9000},
++    RegExtRegionEnd   : '{default: 32'h0300_9000 + 32'h1000},
+     // All non-set values should be zero
+     default: '0
+   };
+diff --git a/hw/cheshire_soc.sv b/hw/cheshire_soc.sv
+index a634cd4..f7d6b00 100644
+--- a/hw/cheshire_soc.sv
++++ b/hw/cheshire_soc.sv
+@@ -427,10 +427,24 @@ module cheshire_soc import cheshire_pkg::*; #(
+     .rsp_o  ( reg_out_rsp[RegOut.err] )
+   );
+ 
+-  // Connect external slaves
+-  if (Cfg.RegExtNumSlv > 0) begin : gen_ext_reg_slv
+-    assign reg_ext_slv_req_o = reg_out_req[RegOut.num_out-1:RegOut.ext_base];
+-    assign reg_out_rsp[RegOut.num_out-1:RegOut.ext_base] = reg_ext_slv_rsp_i;
++  // Connect 1024-bit accelerator register
++  if (Cfg.RegExtNumSlv > 0) begin : gen_accel_1024_reg
++    accel1024 #(
++      .reg_req_t ( reg_req_t ),
++      .reg_rsp_t ( reg_rsp_t )
++    ) i_accel1024 (
++      .clk   ( clk_i ),
++      .rstn  ( rst_ni ),
++      .req   ( reg_out_req[RegOut.ext_base] ),
++      .rsp   ( reg_out_rsp[RegOut.ext_base] )
++    );
++    // Connect remaining external slaves (if any beyond the accelerator)
++    if (Cfg.RegExtNumSlv > 1) begin
++      assign reg_ext_slv_req_o = reg_out_req[RegOut.num_out-1:RegOut.ext_base+1];
++      assign reg_out_rsp[RegOut.num_out-1:RegOut.ext_base+1] = reg_ext_slv_rsp_i;
++    end else begin
++      assign reg_ext_slv_req_o = '0;
++    end
+   end else begin : gen_no_ext_reg_slv
+     assign reg_ext_slv_req_o = '0;
+   end
+diff --git a/hw/regs/cheshire_reg_accel1024.sv b/hw/regs/cheshire_reg_accel1024.sv
+new file mode 100644
+index 0000000..3732c62
+--- /dev/null
++++ b/hw/regs/cheshire_reg_accel1024.sv
+@@ -0,0 +1,104 @@
++module accel1024 #(
++  parameter type reg_req_t = logic,
++  parameter type reg_rsp_t = logic
++) (
++  input  logic        clk,
++  input  logic        rstn,
++  input  reg_req_t    req,
++  output reg_rsp_t    rsp
++);
++
++  // Internal register storage - 3 registers of 1024 bits each 
++  // and an opcode register (1 bit)
++  logic [1023:0] input_reg [0:1]; // 2 1024-bit input registers
++  logic [2047:0] output_reg;      // 1 2048-bit output register
++  
++  // Address decoding - remove the base address offset
++  // Your accelerator sees addresses relative to 0x03009000
++  logic [1:0] reg_select;    // Which of the 3 registers (bits 8:7)
++  logic [4:0] word_select;   // Which 32-bit word (bits 6:2)
++  
++  // The register demux already handles the base address (0x03009000)
++  // You receive addresses 0x000-0xFFF relative to your base
++  assign reg_select  = req.addr[8:7];    // Bit 8:7 selects register 0(00), 1(01), 2(10) or opcode(11)
++  assign word_select = req.addr[6:2];    // Bits 6:2 select word 0-31
++
++  // Handle register reads
++  always_comb begin
++    rsp.ready = 1'b1;
++    rsp.error = 1'b0;
++    rsp.rdata = 32'h0;
++    
++    if (req.valid && !req.write) begin
++      // Extract the appropriate 32-bit word from the selected 1024-bit register
++      // Reading one of the 1024-bit registers
++        case (reg_select[1])
++          // MSB = 0: Read from input registers
++          // MSB = 1: Read from output register, which is 2048 bits wide, so we need to adjust the index
++          // using the lower bit of reg_select
++          1'b0: rsp.rdata = input_reg[reg_select[0]][word_select*32 +: 32];
++          1'b1: rsp.rdata = output_reg[(reg_select[0] * 1024) + (word_select*32) +: 32];
++        endcase
++        
++    end
++  end
++  
++  // Handle writes
++  (* use_dsp = "yes" *)
++  always_ff @(posedge clk or negedge rstn) begin
++    if (!rstn) begin
++      input_reg[0] <= 1024'h0;
++      input_reg[1] <= 1024'h0;
++      output_reg   <= 2048'h0;
++    end else if (req.valid && req.write) begin
++      if (reg_select == 2'b11) begin
++        // Handle the different opcode operations
++        case (req.wdata[2:0])
++        3'b001: begin // Addition in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] + input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b010: begin // Subtraction in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] - input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b011: begin // Bitwise AND in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] & input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b100: begin // Bitwise OR in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] | input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b101: begin // Bitwise XOR in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] ^ input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b110: begin // Multiplication in 32-bit chunks
++          for (int i = 0; i < 32; i++) begin
++            output_reg[i*64 +: 64] <= input_reg[0][i*32 +: 32] * input_reg[1][i*32 +: 32];
++          end
++        end
++        3'b111: begin // Copy lower 32 bits of each 64-bit output element back to input_reg[0]
++        //!!! disclaimer: this will ignor any overflow !!!
++          for (int i = 0; i < 32; i++) begin
++            input_reg[0][i*32 +: 32] <= output_reg[i*64 +: 32];
++          end
++        end
++        default: output_reg <= output_reg; // No operation or invalid opcode
++        endcase
++      end else if (reg_select == 2'b10) begin
++        // Do nothing - output register is read-only
++      end else begin
++        // Write to the appropriate 32-bit word within the selected 1024-bit register
++        input_reg[reg_select][word_select*32 +: 32] <= req.wdata;
++      end
++    end
++  end
++
++endmodule
+diff --git a/sw/boot/cheshire.genesys2.dts b/sw/boot/cheshire.genesys2.dts
+index a4cb478..256ae03 100644
+--- a/sw/boot/cheshire.genesys2.dts
++++ b/sw/boot/cheshire.genesys2.dts
+@@ -32,4 +32,9 @@
+     interrupt-parent = <&PLIC0>;
+     interrupts = <19>;
+   };
++  accel@3009000 {
++    compatible = "custom,accel1024";
++    reg = <0x0 0x3009000 0x0 0x1000>;
++    reg-names = "control";
++  };
+ };
+diff --git a/sw/deps/cva6-sdk b/sw/deps/cva6-sdk
+index 55c1371..80e2bb0 160000
+--- a/sw/deps/cva6-sdk
++++ b/sw/deps/cva6-sdk
+@@ -1 +1 @@
+-Subproject commit 55c137141b62d4b84722d08e0f5d2b9a5af1e77f
++Subproject commit 80e2bb0dfddb3212cedffcb614d21e3e74b06f28
+diff --git a/sw/tests/accel_test.c b/sw/tests/accel_test.c
+new file mode 100644
+index 0000000..6ba028c
+--- /dev/null
++++ b/sw/tests/accel_test.c
+@@ -0,0 +1,338 @@
++// sw/tests/accel_test.c
++#include "regs/cheshire.h"
++#include "dif/clint.h"
++#include "dif/uart.h"
++#include "params.h"
++#include "util.h"
++#include <time.h>
++
++#include <stdio.h>
++#define ACCEL_BASE      0x03009000
++#define ACCEL_REG0_BASE ACCEL_BASE          // 0x03009000
++#define ACCEL_REG1_BASE (ACCEL_BASE + 0x80) // 0x03009080
++#define ACCEL_REG_RESULT_BASE (ACCEL_BASE + 0x100) // 0x03009100
++#define ACCEL_OPCODE_BASE (ACCEL_BASE + 0x180) // 0x03009180
++#define REG_STRIDE 0x80   // 128 bytes
++
++// Write 1024-bit value to register 0
++void write_1024_reg0(uint32_t data[32]) {
++    volatile uint32_t *reg0 = (volatile uint32_t *)ACCEL_REG0_BASE;
++    for (int i = 0; i < 32; i++) {
++        reg0[i] = data[i];
++    } 
++}
++// reg0[0]: b 000000000000
++// reg0[1]: b 000000000100
++// reg0[2]: b 000000001000
++// reg0[3]: b 000000001100
++// ...
++
++// Read 1024-bit value from register 0
++void read_1024_reg0(uint32_t data[32]) {
++    volatile uint32_t *reg0 = (volatile uint32_t *)ACCEL_REG0_BASE;
++    for (int i = 0; i < 32; i++) {
++        data[i] = reg0[i];
++    }
++}
++
++// Write 1024-bit value to register 1
++void write_1024_reg1(uint32_t data[32]) {
++    volatile uint32_t *reg1 = (volatile uint32_t *)ACCEL_REG1_BASE;
++    for (int i = 0; i < 32; i++) {
++        reg1[i] = data[i];
++    }
++}
++
++// Read 1024-bit value from register 1
++void read_1024_reg1(uint32_t data[32]) {
++    volatile uint32_t *reg1 = (volatile uint32_t *)ACCEL_REG1_BASE;
++    for (int i = 0; i < 32; i++) {
++        data[i] = reg1[i];
++    }
++}
++
++// Read the opcode from the accelerator
++void read_opcode(uint32_t *opcode) {
++    volatile uint32_t *opcode_reg = (volatile uint32_t *)ACCEL_OPCODE_BASE;
++    *opcode = *opcode_reg;
++}
++
++// Write the opcode to the accelerator
++void write_opcode(uint32_t opcode) {
++    volatile uint32_t *opcode_reg = (volatile uint32_t *)ACCEL_OPCODE_BASE;
++    *opcode_reg = opcode;
++}
++
++
++
++void add_1024_bit(uint32_t a[32], uint32_t b[32], uint32_t result[32]) {
++    uint64_t carry = 0;
++    for (int i = 0; i < 32; i++) {
++        uint64_t sum = (uint64_t)a[i] + (uint64_t)b[i] + carry;
++        result[i] = (uint32_t)sum;
++        carry = sum >> 32;
++    }
++}
++
++
++int sanity() {
++    char str[] = "ACCEL VECTOR TEST\r\n";
++    uint32_t rtc_freq = *reg32(&__base_regs, CHESHIRE_RTC_FREQ_REG_OFFSET);
++    uint64_t reset_freq = clint_get_core_freq(rtc_freq, 2500);
++    uart_init(&__base_uart, reset_freq, __BOOT_BAUDRATE);
++    uart_write_str(&__base_uart, str, sizeof(str) - 1);
++
++    // Test Register 0 vector write/read
++    uint32_t vec0[32], vec1[32], read0[32], read1[32];
++    for (int i = 0; i < 32; ++i) {vec0[i] = 0xdead0000 + i;}
++    write_1024_reg0(vec0);
++    read_1024_reg0(read0);
++    for (int i = 0; i < 32; ++i){
++        if (read0[i] != vec0[i]) {
++            char err[] = "ACCEL FAIL: R0[%02d] = %08x\r\n";
++            uart_write_str(&__base_uart, err, sizeof(err) - 1);
++            return 1;
++        }
++    }
++    char ok0[] = "ACCEL R0 OK\r\n";
++    uart_write_str(&__base_uart, ok0, sizeof(ok0) - 1); 
++
++    // Test Register 1 vector write/read
++    for (int i = 0; i < 32; ++i) {vec1[i] = 0xbeef0000 + i;}
++    write_1024_reg1(vec1);
++    read_1024_reg1(read1);
++    for (int i = 0; i < 32; ++i){
++        if (read1[i] != vec1[i]) {
++            char err[] = "ACCEL FAIL: R1[%02d] = %08x\r\n";
++            uart_write_str(&__base_uart, err, sizeof(err) - 1);
++            return 1;
++        }
++    }
++    char ok1[] = "ACCEL R1 OK\r\n";
++    uart_write_str(&__base_uart, ok1, sizeof(ok1) - 1); 
++    
++
++
++
++    // Vector addition test (opcode 0b001)
++    for (int i = 0; i < 32; ++i) {
++        vec0[i] = i + 1;
++        vec1[i] = (i + 1) * 2;
++    }
++    write_1024_reg0(vec0);
++    write_1024_reg1(vec1);
++    write_opcode(0x1);
++    volatile uint32_t *reg_result = (volatile uint32_t *)ACCEL_REG_RESULT_BASE;
++    uint32_t result[32];
++    uint32_t j = 0;
++    for (int i = 0; i < 32; ++i) {
++        result[i] = reg_result[j];
++        j+=2;
++    }
++    for (int i = 0; i < 32; ++i) {
++        uint32_t expected = vec0[i] + vec1[i];
++        if (result[i] != (uint32_t)expected) {
++            char err[] = "ACCEL FAIL: ADD[%02d] = %08x\r\n";
++            uart_write_str(&__base_uart, err, sizeof(err) - 1);
++            uart_write_flush(&__base_uart);
++            return 1;
++        }
++    }
++    char ok[] = "ACCEL ADD OK\r\n";
++    uart_write_str(&__base_uart, ok, sizeof(ok) - 1); 
++
++    for (int i = 0; i < 32; ++i) {vec0[i] = 0x0;}
++    for (int i = 0; i < 32; ++i) {vec1[i] = 0x0000beef + i;}
++    write_1024_reg0(vec0);
++    write_1024_reg1(vec1);
++    write_opcode(0x1); // addition
++    write_opcode(0x7); // move to reg0
++    uint32_t data0[32];
++    read_1024_reg0(data0);
++    for (int i = 0; i < 32; ++i) {
++        uint32_t expected = vec0[i] + vec1[i];
++        if (data0[i] != (uint32_t)expected) {
++            char err[] = "ACCEL FAIL: MOVE ADD[%02d] = %08x\r\n";
++            uart_write_str(&__base_uart, err, sizeof(err) - 1);
++            uart_write_flush(&__base_uart);
++            return 1;
++        }
++    }
++    char ok_move[] = "ACCEL MOVE ADD OK\r\n";
++    uart_write_str(&__base_uart, ok_move, sizeof(ok_move) - 1);
++
++    uart_write_flush(&__base_uart);
++    return 0;
++}
++
++
++int accel_performance(volatile uint32_t* reg0, volatile uint32_t* reg1){
++    for (int i = 0; i < 32; ++i) {
++        reg0[i] = 0xdead0000 + i;
++    }
++    for (int i = 0; i < 32; ++i) {
++        reg1[i] = 0xbeef0000 + i;
++    }
++    //Add
++    write_opcode(0x1);
++   
++    //multiplication
++    write_opcode(0x6);
++  
++    return 0;
++} 
++
++int base_performance(uint32_t reg0[32], uint32_t reg1[32], uint64_t res[32]) {
++    for (int i = 0; i < 32; ++i) {
++        reg0[i] = 0xdead0000 + i;
++    }
++    for (int i = 0; i < 32; ++i) {
++        reg1[i] = 0xbeef0000 + i;
++    }
++    //Add
++    for (int i = 0; i < 32; ++i) {
++        res[i] = (uint64_t)(reg0[i]) + (uint64_t)(reg1[i]);
++    }
++    
++    //multiplication
++    for (int i = 0; i < 32; ++i) {
++        res[i] = (uint64_t)(reg0[i]) * (uint64_t)(reg1[i]);
++    }
++    return 0;
++}
++
++int accel_complex_performance(volatile uint32_t* reg0, volatile uint32_t* reg1){
++    for (int i = 0; i < 32; ++i) {
++        reg0[i] = 0;
++    }
++    for (int j = 0; j < 100; ++j) {
++        for (int i = 0; i < 32; ++i) {
++            reg1[i] = 0x0000dead + i;
++        }
++        //Add
++        write_opcode(0x1);
++        // move to reg0
++        write_opcode(0x7);
++
++        for (int i = 0; i < 32; ++i) {
++            reg1[i] = 0x0000beef + i;
++        }
++       
++        //multiplication
++        write_opcode(0x6);
++    
++        // move to reg0
++        write_opcode(0x7);
++    }
++  
++    return 0;
++} 
++
++int base_complex_performance(uint32_t reg0[32], uint32_t reg1[32], uint64_t res[32]) {
++    for (int i = 0; i < 32; ++i) {
++        reg0[i] = 0;
++    }
++    for (int j = 0; j < 100; ++j) {
++        for (int i = 0; i < 32; ++i) {
++            reg1[i] = 0x0000dead + i;
++        }
++        //Add
++        for (int i = 0; i < 32; ++i) {
++            reg0[i] = reg0[i] + reg1[i];
++        }
++
++        for (int i = 0; i < 32; ++i) {
++            reg1[i] = 0x0000beef + i;
++        }
++       
++        //multiplication
++        for (int i = 0; i < 32; ++i) {
++            reg0[i] = reg0[i] * reg1[i];
++        }
++    }
++    return 0;
++}
++
++
++
++void uint32_to_str(uint32_t num, char *str) {
++    int i = 0;
++    if (num == 0) {
++        str[i++] = '0';
++        str[i] = '\0';
++        return;
++    }
++    
++    // Convert number to string in reverse
++    char temp[12]; // Max 10 digits for uint32_t + sign + null
++    int j = 0;
++    while (num > 0) {
++        temp[j++] = '0' + (num % 10);
++        num /= 10;
++    }
++    
++    // Reverse the string
++    while (j > 0) {
++        str[i++] = temp[--j];
++    }
++    for (; i < 50; i++) {
++        str[i] = '\0';
++    }
++    
++}
++
++int main() {
++    if(sanity() != 0) {
++        return 1;
++    }
++    
++    // base registers
++    uint32_t base_reg0[32];
++    uint32_t base_reg1[32];
++    uint64_t base_res[32];
++
++    // accel registers
++    volatile uint32_t *accel_reg0 = (volatile uint32_t *)ACCEL_REG0_BASE;
++    volatile uint32_t *accel_reg1 = (volatile uint32_t *)ACCEL_REG1_BASE;
++    volatile uint32_t *accel_reg_result = (volatile uint32_t *)ACCEL_REG_RESULT_BASE;
++
++    uint32_t accel_avg = 0, base_avg = 0;
++    uint64_t start, end;
++    
++    for (size_t i = 1; i <= 10; i++)
++    {
++        start = clint_get_mtime();
++        accel_complex_performance(accel_reg0, accel_reg1);
++        end = clint_get_mtime();
++        uint64_t elapsed = end - start; 
++        accel_avg = ((accel_avg * (i - 1)) + elapsed) / i;
++
++        start = clint_get_mtime();
++        base_complex_performance(base_reg0, base_reg1, base_res);
++        end = clint_get_mtime();
++        elapsed = end - start;
++        base_avg = ((base_avg * (i - 1)) + elapsed) / i;
++    }
++    uint32_t rtc_freq = *reg32(&__base_regs, CHESHIRE_RTC_FREQ_REG_OFFSET);
++    uint64_t reset_freq = clint_get_core_freq(rtc_freq, 2500);
++    uart_init(&__base_uart, reset_freq, __BOOT_BAUDRATE);
++
++    char accel_avg_str[50];
++    char base_avg_str[50];
++    uint32_to_str(accel_avg, accel_avg_str);
++    uint32_to_str(base_avg, base_avg_str);
++    char accel_msg[] = "Complex Accel avg: ";
++    uart_write_str(&__base_uart, accel_msg, sizeof(accel_msg) - 1);
++    uart_write_str(&__base_uart, accel_avg_str, 50);
++    char newline1[] = "\r\n";
++    uart_write_str(&__base_uart, newline1, sizeof(newline1) - 1);
++
++    char base_msg[] = "Complex Base avg: ";
++    uart_write_str(&__base_uart, base_msg, sizeof(base_msg) - 1);
++    uart_write_str(&__base_uart, base_avg_str, 50);
++    char newline2[] = "\r\n";
++    uart_write_str(&__base_uart, newline2, sizeof(newline2) - 1);
++
++    uart_write_flush(&__base_uart);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/target/sim/src/fixture_cheshire_soc.sv b/target/sim/src/fixture_cheshire_soc.sv
+index 056f0b3..698e5d7 100644
+--- a/target/sim/src/fixture_cheshire_soc.sv
++++ b/target/sim/src/fixture_cheshire_soc.sv
+@@ -63,6 +63,11 @@ module fixture_cheshire_soc #(
+   logic [SlinkNumChan-1:0][SlinkNumLanes-1:0] slink_i;
+   logic [SlinkNumChan-1:0][SlinkNumLanes-1:0] slink_o;
+ 
++  // External register interface signals for accelerator
++  reg_req_t reg_ext_req;
++  reg_rsp_t reg_ext_rsp;
++  logic [1023:0] big_reg_debug [0:1];
++
+   cheshire_soc #(
+     .Cfg                ( DutCfg ),
+     .ExtHartinfo        ( '0 ),
+@@ -86,8 +91,8 @@ module fixture_cheshire_soc #(
+     .axi_ext_mst_rsp_o  ( ),
+     .axi_ext_slv_req_o  ( ),
+     .axi_ext_slv_rsp_i  ( '0 ),
+-    .reg_ext_slv_req_o  ( ),
+-    .reg_ext_slv_rsp_i  ( '0 ),
++    .reg_ext_slv_req_o  ( reg_ext_req ),
++    .reg_ext_slv_rsp_i  ( reg_ext_rsp ),
+     .intr_ext_i         ( '0 ),
+     .intr_ext_o         ( ),
+     .xeip_ext_o         ( ),
+@@ -145,6 +150,9 @@ module fixture_cheshire_soc #(
+     .usb_dp_oe_o        ( )
+   );
+ 
++
++
++
+   ////////////////////////
+   //  Tristate Adapter  //
+   ////////////////////////
+diff --git a/target/sim/vsim/start.cheshire_soc.tcl b/target/sim/vsim/start.cheshire_soc.tcl
+index e6a005d..386ea7a 100644
+--- a/target/sim/vsim/start.cheshire_soc.tcl
++++ b/target/sim/vsim/start.cheshire_soc.tcl
+@@ -24,6 +24,7 @@ if { ![info exists CXX_PATH] } {
+ # Set voptargs only if not already set to make overridable.
+ # Default on fast simulation flags.
+ if { ![info exists VOPTARGS] } {
++    # set VOPTARGS "-O0 +acc -permissive" for debug
+     set VOPTARGS "-O5 +acc=p+tb_cheshire_soc. +noacc=p+cheshire_soc. +acc=r+stream_xbar -permissive"
+ }
+ 
+diff --git a/target/xilinx/scripts/common.tcl b/target/xilinx/scripts/common.tcl
+index abe315d..c6ed891 100644
+--- a/target/xilinx/scripts/common.tcl
++++ b/target/xilinx/scripts/common.tcl
+@@ -40,8 +40,8 @@ proc init_impl {xilinx_root argc argv} {
+         return -code error
+     }
+     # Configure parallelism
+-    set num_threads 8
+-    set num_jobs 8
++    set num_threads 20
++    set num_jobs 20
+     # Get arguments
+     set board [lindex $argv 0]
+     set proj [lindex $argv 1]
+diff --git a/target/xilinx/scripts/impl_ip.tcl b/target/xilinx/scripts/impl_ip.tcl
+index 43343e6..6f1ea36 100644
+--- a/target/xilinx/scripts/impl_ip.tcl
++++ b/target/xilinx/scripts/impl_ip.tcl
+@@ -136,8 +136,8 @@ switch $proj {
+                 set_property -dict [list \
+                     CONFIG.C_NUM_PROBE_OUT {3} \
+                     CONFIG.C_PROBE_OUT0_INIT_VAL {0x0} \
+-                    CONFIG.C_PROBE_OUT1_INIT_VAL {0x0} \
+-                    CONFIG.C_PROBE_OUT2_INIT_VAL {0x0} \
++                    CONFIG.C_PROBE_OUT1_INIT_VAL {0x1} \
++                    CONFIG.C_PROBE_OUT2_INIT_VAL {0x1} \
+                     CONFIG.C_PROBE_OUT1_WIDTH {2} \
+                     CONFIG.C_EN_PROBE_IN_ACTIVITY {0} \
+                     CONFIG.C_NUM_PROBE_IN {0} \
+diff --git a/target/xilinx/src/cheshire_top_xilinx.sv b/target/xilinx/src/cheshire_top_xilinx.sv
+index 5215b96..de41975 100644
+--- a/target/xilinx/src/cheshire_top_xilinx.sv
++++ b/target/xilinx/src/cheshire_top_xilinx.sv
+@@ -127,16 +127,19 @@ module cheshire_top_xilinx import cheshire_pkg::*; #(
+     ret.Usb = 0;
+   `endif
+   `ifdef USE_CFG_REGS
+-    ret.RegExtNumSlv   = 1;
+-    ret.RegExtNumRules = 1;
+-    // Mirror the address map of the internal configuration registers.
+-    // * 256K @ AXI: 0x4000_0000
+-    // * 4K   @ AXI: 0x4100_0000
+-    // * 256K @ Reg: 0x4200_0000
+-    // * 4K   @ Reg: 0x4300_0000
+-    ret.RegExtRegionIdx   [0] = 0;
+-    ret.RegExtRegionStart [0] = 32'h4300_0000;
+-    ret.RegExtRegionEnd   [0] = 32'h4300_1000;
++    // // Mirror the address map of the internal configuration registers.
++    // // * 256K @ AXI: 0x4000_0000
++    // // * 4K   @ AXI: 0x4100_0000
++    // // * 256K @ Reg: 0x4200_0000
++    // // * 4K   @ Reg: 0x4300_0000
++    ret.RegExtNumSlv      = 2;
++    ret.RegExtNumRules    = 2;
++    ret.RegExtRegionIdx[0]   = 0;
++    ret.RegExtRegionIdx[1]   = 1;
++    ret.RegExtRegionStart[0] = 32'h0300_9000;
++    ret.RegExtRegionStart[1] = 32'h4300_0000;
++    ret.RegExtRegionEnd[0]   = 32'h0300_9000 + 32'h1000;
++    ret.RegExtRegionEnd[1]   = 32'h4300_0000 + 32'h1000;
+   `endif
+   `ifdef USE_VCLIC
+     ret.Clic = 1;
